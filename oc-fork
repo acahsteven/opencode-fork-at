@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+#
+# oc-fork - fork an OpenCode session at ANY message, including ones the TUI
+#           no longer shows (the TUI only keeps the newest 100 per session).
+#
+# It reads the full transcript via `opencode export`, resolves the target
+# message, then calls the server API POST /session/{id}/fork {messageID}.
+#
+set -euo pipefail
+umask 077   # transcript temp files are created 0600, not world-readable
+
+OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
+PORT="${OPENCODE_PORT:-0}"
+URL=""
+DIRECTORY=""
+SID=""
+MODE=""
+PATTERN=""
+OCC="last"
+MSGID=""
+INDEX=""
+INCLUDE=0
+DRY_RUN=0
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+	cat <<'EOF'
+oc-fork - fork an OpenCode session at any message, even ones the TUI hides.
+
+USAGE:
+  oc-fork <sessionID> --list
+  oc-fork <sessionID> --index N
+  oc-fork <sessionID> --search "text" [--first]
+  oc-fork <sessionID> --msg-id msg_xxx
+  oc-fork <sessionID> --msg-id msg_xxx --include
+  oc-fork <sessionID> --msg-id msg_xxx --dry-run
+
+SELECTION (pick one):
+  --list                 print forkable user messages with their 1-based index
+  --index N              select the N-th forkable user message (1 = oldest)
+  --search "TEXT"        select a user message containing TEXT (case-insensitive)
+                         by default the most recent match; use --first for oldest
+  --msg-id msg_xxx       select a message directly (must start with "msg")
+
+FORK POINT:
+  OpenCode copies the transcript strictly BEFORE the message you pass to the
+  fork API (the TUI "Fork" behaves the same way and then re-sends that prompt).
+  By default this script passes your selected message, so the new session ends
+  just before it.
+  --include              also include the selected message in the new session
+                         (targets the next message internally)
+
+OPTIONS:
+  -d, --directory DIR    project directory to pass to the server (optional)
+  -u, --url URL          use an already-running server instead of spawning one
+  -p, --port PORT        port for the spawned server (0 = random, default)
+      --dry-run          resolve the message, print what would happen, don't fork
+  -h, --help             show this help
+
+ENV:
+  OPENCODE_BIN           path to the opencode binary (default: opencode)
+  OPENCODE_PORT          default port for the spawned server
+
+EXAMPLES:
+  oc-fork ses_abc123 --list
+  oc-fork ses_abc123 --search "设计一个脚本" --first
+  oc-fork ses_abc123 --index 12
+  oc-fork ses_abc123 --msg-id msg_xyz --dry-run
+
+OUTPUT:
+  human-readable progress goes to stderr; the selected/created message or
+  session id is printed to stdout.
+
+TIP:
+  put this file somewhere on PATH, e.g. ~/.local/bin (add it to ~/.zshrc):
+    export PATH="$HOME/.local/bin:$PATH"
+EOF
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-h|--help) usage; exit 0 ;;
+		-d|--directory) DIRECTORY="${2:-}"; shift 2 ;;
+		-u|--url) URL="${2:-}"; shift 2 ;;
+		-p|--port) PORT="${2:-}"; shift 2 ;;
+		--list) MODE="list"; shift ;;
+		--index) MODE="index"; INDEX="${2:-}"; shift 2 ;;
+		--search) MODE="search"; PATTERN="${2:-}"; shift 2 ;;
+		--first) OCC="first"; shift ;;
+		--last) OCC="last"; shift ;;
+		--msg-id|--message|--message-id) MODE="msgid"; MSGID="${2:-}"; shift 2 ;;
+		--include) INCLUDE=1; shift ;;
+		--dry-run) DRY_RUN=1; shift ;;
+		-*) die "unknown option: $1" ;;
+		*) [ -z "$SID" ] || die "unexpected argument: $1"; SID="$1"; shift ;;
+	esac
+done
+
+[ -n "$SID" ] || { usage; die "missing sessionID"; }
+[ -n "$MODE" ] || { usage; die "choose one of --list / --index / --search / --msg-id"; }
+
+command -v "$OPENCODE_BIN" >/dev/null 2>&1 || die "'$OPENCODE_BIN' not found (set OPENCODE_BIN)"
+command -v jq >/dev/null 2>&1 || die "jq not found"
+command -v curl >/dev/null 2>&1 || die "curl not found"
+
+# jq: the array of forkable user messages (user + a real text part), same rule
+# the TUI fork dialog uses.
+FORKABLE='.messages | map(select(.info.role=="user" and ([.parts[]? | select(.type=="text" and (.synthetic!=true) and (.ignored!=true))] | length > 0)))'
+
+TMP="$(mktemp "${TMPDIR:-/tmp}/oc-fork.XXXXXX")"
+EXPORT="$TMP.json"
+LOG="$TMP.log"
+cleanup() {
+	rm -f "$TMP" "$EXPORT" "$LOG" 2>/dev/null || true
+	if [ -n "${SERVER_PID:-}" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi
+}
+trap cleanup EXIT INT TERM
+
+printf 'Reading session %s ...\n' "$SID" >&2
+"$OPENCODE_BIN" export "$SID" >"$EXPORT" 2>/dev/null || die "failed to export session '$SID'"
+jq -e '.messages' "$EXPORT" >/dev/null 2>&1 || die "unexpected export output for '$SID'"
+
+# ---------------------------------------------------------------------------
+# resolve target message
+# ---------------------------------------------------------------------------
+if [ "$MODE" = "list" ]; then
+	jq -r "$FORKABLE"' | to_entries[]
+		| "\(.key + 1)\t\(.value.info.id)\t\((.value.info.time.created / 1000 | floor | strftime("%Y-%m-%d %H:%M")))\t\(([.value.parts[]? | select(.type=="text") | .text] | join(" ") | gsub("\n"; " ") | .[0:70]))"' "$EXPORT"
+	exit 0
+fi
+
+case "$MODE" in
+	msgid)
+		case "$MSGID" in msg*) : ;; *) die "message id must start with 'msg': $MSGID" ;; esac
+		;;
+	index)
+		case "$INDEX" in ''|*[!0-9]*) die "--index expects a positive integer" ;; esac
+		MSGID="$(jq -r --argjson n "$INDEX" "$FORKABLE"' | .[$n - 1].info.id // empty' "$EXPORT")"
+		[ -n "$MSGID" ] || die "index $INDEX is out of range"
+		;;
+	search)
+		[ -n "$PATTERN" ] || die "--search needs a pattern"
+		MSGID="$(jq -r --arg q "$PATTERN" --arg occ "$OCC" "$FORKABLE"' | map(select(([.parts[]? | select(.type=="text") | .text] | join(" ")) | test($q; "i"))) | (if $occ=="first" then first else last end) | .info.id // empty' "$EXPORT")"
+		[ -n "$MSGID" ] || die "no user message matched: $PATTERN"
+		;;
+esac
+
+jq -r --arg id "$MSGID" "$FORKABLE"' | map(select(.info.id == $id)) | .[0]
+	| "selected \(.info.id)  [\(.info.time.created / 1000 | floor | strftime("%Y-%m-%d %H:%M"))]\n  \(([.parts[]? | select(.type=="text") | .text] | join(" ") | gsub("\n"; " ") | .[0:100]))"' "$EXPORT" >&2
+
+# The fork API copies history strictly BEFORE the messageID you pass. To include
+# the selected message, pass the id of the next message in the transcript.
+FORK_ID="$MSGID"
+if [ "$INCLUDE" -eq 1 ]; then
+	FORK_ID="$(jq -r --arg id "$MSGID" '.messages as $m
+		| ([range(0; $m | length) | select($m[.].info.id == $id)][0]) as $i
+		| if $i == null then empty
+		  elif ($i + 1) < ($m | length) then $m[$i + 1].info.id
+		  else "END" end' "$EXPORT")"
+	[ -n "$FORK_ID" ] || die "could not locate selected message in transcript"
+	[ "$FORK_ID" != "END" ] || die "--include cannot include the very last message (nothing to fork before); omit --include for a full fork"
+	printf 'include: yes -> history copied through %s\n' "$FORK_ID" >&2
+else
+	printf 'include: no  -> new session ends before the selected message\n' >&2
+fi
+
+# ---------------------------------------------------------------------------
+# fork via server API
+# ---------------------------------------------------------------------------
+if [ "$DRY_RUN" -eq 1 ]; then
+	printf '\n[dry-run] would POST %s/session/%s/fork\n  body: %s\n' \
+		"${URL:-http://127.0.0.1:<port>}" "$SID" "$(jq -cn --arg id "$FORK_ID" '{messageID:$id}')" >&2
+	printf '%s\n' "$MSGID"
+	exit 0
+fi
+
+BASE="${URL%/}"
+if [ -z "$BASE" ]; then
+	: >"$LOG"
+	"$OPENCODE_BIN" serve --port "$PORT" >"$LOG" 2>&1 &
+	SERVER_PID=$!
+	i=0
+	while [ "$i" -lt 300 ]; do
+		BASE="$(grep -oE 'http://127\.0\.0\.1:[0-9]+' "$LOG" 2>/dev/null | head -1 || true)"
+		[ -n "$BASE" ] && break
+		kill -0 "$SERVER_PID" 2>/dev/null || { cat "$LOG" >&2; die "opencode serve failed to start"; }
+		i=$((i + 1))
+		sleep 0.1
+	done
+	[ -n "$BASE" ] || { cat "$LOG" >&2; die "timed out waiting for server"; }
+fi
+
+QS=""
+[ -n "$DIRECTORY" ] && QS="?directory=$(jq -rn --arg d "$DIRECTORY" '$d|@uri')"
+
+RESP="$(curl -sS -X POST "$BASE/session/$SID/fork$QS" \
+	-H 'content-type: application/json' \
+	--data "$(jq -cn --arg id "$FORK_ID" '{messageID:$id}')")"
+
+NEW_ID="$(printf '%s' "$RESP" | jq -r '.id // empty' 2>/dev/null || true)"
+if [ -z "$NEW_ID" ]; then
+	printf 'fork failed: %s\n' "$RESP" >&2
+	exit 1
+fi
+
+printf '\nforked -> %s\n' "$NEW_ID" >&2
+printf 'title  : %s\n' "$(printf '%s' "$RESP" | jq -r '.title // ""')" >&2
+printf 'open   : opencode --session %s\n' "$NEW_ID" >&2
+printf '%s\n' "$NEW_ID"
