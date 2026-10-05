@@ -37,7 +37,7 @@ oc-fork <sessionID> --list                    # list forkable user messages (ind
 oc-fork <sessionID> --search "text"           # most recent match; --first for earliest
 oc-fork <sessionID> --index 12                # 12th user message (1 = oldest)
 oc-fork <sessionID> --msg-id msg_xxx          # pick directly
-oc-fork <sessionID> --index 12 --include      # also include the selected message
+oc-fork <sessionID> --index 12 --include      # keep the whole rest of that turn
 oc-fork <sessionID> --index 12 --dry-run      # resolve + show the request, don't fork
 ```
 
@@ -52,7 +52,7 @@ Get a session id with `opencode session list`.
 | `--search TEXT` | select a user message containing `TEXT` (case-insensitive) |
 | `--first` / `--last` | earliest / latest match for `--search` (default `last`) |
 | `--msg-id msg_xxx` | select a message directly |
-| `--include` | include the selected message in the new session (see below) |
+| `--include` | keep the selected message **and the rest of its turn** (see below) |
 | `-d, --directory DIR` | project directory to pass to the server |
 | `-u, --url URL` | reuse an already-running server instead of spawning one |
 | `-p, --port PORT` | port for the spawned server (0 = random, default) |
@@ -67,9 +67,20 @@ The server copies the transcript **strictly before** the `messageID` you pass �
 target message itself is **not** included. This matches the TUI's *Fork* action, which
 then re-sends that message's prompt into the new session.
 
-- **default**: the new session ends just before the selected message.
-- **`--include`**: the selected message is included too (internally it targets the next
-  message as the cut point). Handy when you want to replay from an old prompt.
+- **default**: the new session ends just before the selected message (the TUI-like
+  "branch off, then re-send that prompt" behaviour).
+- **`--include`**: keep the selected message **and the whole rest of its turn** —
+  history is copied up to (but not including) the **next real user message**, so the
+  assistant's replies and tool calls for that turn are preserved. If the selected
+  message is the last real user turn, the entire session is copied (no `messageID`).
+
+### Titles
+
+OpenCode derives a fork's title purely from the parent title string
+(`"X" -> "X (fork #1)"`, `"X (fork #n)" -> "X (fork #n+1)"`), so forking the **same**
+session repeatedly would otherwise create several identical `(fork #1)` sessions.
+`oc-fork` detects the collision and renumbers the new session to the next free index
+by querying sibling sessions (`GET /session?search=...`) and `PATCH`ing the title.
 
 ## How it works
 
@@ -85,7 +96,7 @@ opencode export <sid>   →   resolve target msgID   →   opencode serve + POST
 
    ```http
    POST /session/{sessionID}/fork
-   { "messageID": "msg_xxx" }
+   { "messageID": "msg_xxx" }     # or {} to copy the whole session
    ```
 
    The server (`Session.fork`) loads **all** messages from storage, takes

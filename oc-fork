@@ -48,8 +48,10 @@ FORK POINT:
   fork API (the TUI "Fork" behaves the same way and then re-sends that prompt).
   By default this script passes your selected message, so the new session ends
   just before it.
-  --include              also include the selected message in the new session
-                         (targets the next message internally)
+  --include              keep the selected message AND the whole rest of its
+                         turn: history is copied up to (not including) the next
+                         real user message. If the selected message is the last
+                         real user turn, the entire session is copied.
 
 OPTIONS:
   -d, --directory DIR    project directory to pass to the server (optional)
@@ -149,20 +151,39 @@ esac
 jq -r --arg id "$MSGID" "$FORKABLE"' | map(select(.info.id == $id)) | .[0]
 	| "selected \(.info.id)  [\(.info.time.created / 1000 | floor | strftime("%Y-%m-%d %H:%M"))]\n  \(([.parts[]? | select(.type=="text") | .text] | join(" ") | gsub("\n"; " ") | .[0:100]))"' "$EXPORT" >&2
 
-# The fork API copies history strictly BEFORE the messageID you pass. To include
-# the selected message, pass the id of the next message in the transcript.
+# The fork API copies history strictly BEFORE the messageID you pass. With
+# --include we pass the *next real user message* instead, so the whole rest of
+# the selected turn (that message + assistant replies + tool calls) is kept.
+# If there is no next user turn, we omit messageID to copy the full session.
 FORK_ID="$MSGID"
+OMIT=0
 if [ "$INCLUDE" -eq 1 ]; then
 	FORK_ID="$(jq -r --arg id "$MSGID" '.messages as $m
 		| ([range(0; $m | length) | select($m[.].info.id == $id)][0]) as $i
 		| if $i == null then empty
-		  elif ($i + 1) < ($m | length) then $m[$i + 1].info.id
-		  else "END" end' "$EXPORT")"
+		  else
+		    ([range($i + 1; $m | length)
+		      | select($m[.].info.role == "user"
+		               and ([$m[.].parts[]? | select(.type=="text" and (.synthetic!=true) and (.ignored!=true))] | length > 0))][0]) as $next
+		    | if $next == null then "END" else $m[$next].info.id end
+		  end' "$EXPORT")"
 	[ -n "$FORK_ID" ] || die "could not locate selected message in transcript"
-	[ "$FORK_ID" != "END" ] || die "--include cannot include the very last message (nothing to fork before); omit --include for a full fork"
-	printf 'include: yes -> history copied through %s\n' "$FORK_ID" >&2
+	if [ "$FORK_ID" = "END" ]; then
+		OMIT=1
+		FORK_ID=""
+		printf 'include: yes -> no later user turn; copying the full session\n' >&2
+	else
+		printf 'include: yes -> copying history up to the next user message (%s)\n' "$FORK_ID" >&2
+	fi
 else
 	printf 'include: no  -> new session ends before the selected message\n' >&2
+fi
+
+# request body: omit messageID to copy the whole session
+if [ "$OMIT" -eq 1 ]; then
+	BODY='{}'
+else
+	BODY="$(jq -cn --arg id "$FORK_ID" '{messageID:$id}')"
 fi
 
 # ---------------------------------------------------------------------------
@@ -170,7 +191,7 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$DRY_RUN" -eq 1 ]; then
 	printf '\n[dry-run] would POST %s/session/%s/fork\n  body: %s\n' \
-		"${URL:-http://127.0.0.1:<port>}" "$SID" "$(jq -cn --arg id "$FORK_ID" '{messageID:$id}')" >&2
+		"${URL:-http://127.0.0.1:<port>}" "$SID" "$BODY" >&2
 	printf '%s\n' "$MSGID"
 	exit 0
 fi
@@ -196,7 +217,7 @@ QS=""
 
 RESP="$(curl -sS -X POST "$BASE/session/$SID/fork$QS" \
 	-H 'content-type: application/json' \
-	--data "$(jq -cn --arg id "$FORK_ID" '{messageID:$id}')")"
+	--data "$BODY")"
 
 NEW_ID="$(printf '%s' "$RESP" | jq -r '.id // empty' 2>/dev/null || true)"
 if [ -z "$NEW_ID" ]; then
@@ -204,7 +225,38 @@ if [ -z "$NEW_ID" ]; then
 	exit 1
 fi
 
+NEW_TITLE="$(printf '%s' "$RESP" | jq -r '.title // ""')"
+
+# OpenCode derives the new title purely from the parent title string:
+#   "X"          -> "X (fork #1)"
+#   "X (fork #n)" -> "X (fork #n+1)"
+# so forking the SAME session repeatedly produces identical "(fork #1)" titles.
+# Renumber to the next free index by scanning sibling sessions with that base.
+BASE_TITLE="${NEW_TITLE% (fork #*)}"
+if [ -n "$BASE_TITLE" ]; then
+	MAXN="$(curl -sS --get \
+		--data-urlencode "search=$BASE_TITLE" \
+		--data-urlencode "limit=1000" \
+		"$BASE/session" \
+		| jq -r --arg base "$BASE_TITLE" --arg id "$NEW_ID" '
+			[ .[]
+			  | select(.id != $id)
+			  | (.title | capture("^(?<b>.*) \\(fork #(?<n>[0-9]+)\\)$")?)
+			  | select(.b == $base)
+			  | (.n | tonumber)
+			] | (max // 0)' 2>/dev/null || true)"
+	case "$MAXN" in ''|*[!0-9]*) MAXN=0 ;; esac
+	WANT_TITLE="$BASE_TITLE (fork #$((MAXN + 1)))"
+	if [ "$WANT_TITLE" != "$NEW_TITLE" ]; then
+		if curl -sS -X PATCH "$BASE/session/$NEW_ID$QS" \
+			-H 'content-type: application/json' \
+			--data "$(jq -cn --arg t "$WANT_TITLE" '{title:$t}')" >/dev/null 2>&1; then
+			NEW_TITLE="$WANT_TITLE"
+		fi
+	fi
+fi
+
 printf '\nforked -> %s\n' "$NEW_ID" >&2
-printf 'title  : %s\n' "$(printf '%s' "$RESP" | jq -r '.title // ""')" >&2
+printf 'title  : %s\n' "$NEW_TITLE" >&2
 printf 'open   : opencode --session %s\n' "$NEW_ID" >&2
 printf '%s\n' "$NEW_ID"
